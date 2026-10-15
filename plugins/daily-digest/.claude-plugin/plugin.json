@@ -1,0 +1,9 @@
+{
+  "name": "daily-digest",
+  "displayName": "Daily Digest",
+  "version": "0.1.0",
+  "description": "Chọn bài daily.dev mỗi ngày dựa trên việc bạn đang làm, gửi qua file hoặc Telegram",
+  "author": { "name": "Your Name" },
+  "license": "MIT",
+  "keywords": ["daily.dev", "digest", "reading-list"]
+}

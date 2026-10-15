@@ -1,0 +1,12 @@
+{
+  "name": "dev-digest",
+  "owner": { "name": "Your Name" },
+  "metadata": { "description": "Plugin tạo digest bài viết daily.dev theo việc bạn đang làm" },
+  "plugins": [
+    {
+      "name": "daily-digest",
+      "source": "./plugins/daily-digest",
+      "description": "Mỗi ngày chọn bài daily.dev phù hợp với commit, câu hỏi Claude Code gần đây và sở thích của bạn"
+    }
+  ]
+}
