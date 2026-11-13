@@ -1,23 +1,33 @@
 #!/usr/bin/env node
-// Chạy một lần: dựng prompt -> claude -p -> lưu ~/.daily-digest/digests/YYYY-MM-DD.md -> Telegram (nếu cấu hình)
-// Tùy chọn: --dry-run (chỉ in prompt), --no-send (không gửi Telegram)
+// Chạy một lần: lấy bài từ các nguồn -> claude -p chọn bài -> lưu ~/.daily-digest/digests/YYYY-MM-DD.md -> gửi các kênh đã bật
+// Tùy chọn:
+//   --dry-run   chỉ in prompt sẽ gửi cho Claude (không gọi Claude, không tìm theo chủ đề)
+//   --sources   chỉ thử các nguồn tin và in số bài lấy được
+//   --resend    gửi lại digest mới nhất tới các kênh (không gọi Claude)
+//   --no-send   tạo digest nhưng không gửi
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import {
-  DIGEST_DIR, buildPrompt, ensureDirs, extractUrls, loadConfig, log, saveSeen,
+  DIGEST_DIR, MARKER, buildPrompt, buildTopicsPrompt, ensureDirs, extractUrls, loadConfig, loadSeen, log,
+  parseTopics, saveSeen, workContext,
 } from './lib.mjs';
+import { collectCandidates, formatCandidates } from './sources/index.mjs';
+import { channels, deliver } from './deliver/index.mjs';
 
 const args = new Set(process.argv.slice(2));
 
-function runClaude(config, prompt) {
+function runClaude(config, prompt, { allowedTools = [], timeoutMinutes = config.timeoutMinutes } = {}) {
   return new Promise((resolve, reject) => {
     const claude = config.claudePath || 'claude';
     const claudeArgs = [
       '-p',
-      'Thực hiện nhiệm vụ trong nội dung đầu vào.',
-      '--allowedTools',
-      ...config.allowedTools,
+      `${MARKER} Thực hiện nhiệm vụ trong nội dung đầu vào.`,
+      // Prompt chứa tiêu đề bài lấy từ internet, nên tắt hết tool có sẵn (Bash, Read, WebFetch...).
+      // Chỉ còn tool MCP được liệt kê trong --allowedTools.
+      '--tools',
+      '',
+      ...(allowedTools.length ? ['--allowedTools', ...allowedTools] : []),
     ];
     // Đảm bảo `node` có trong PATH khi chạy từ cron/launchd/Task Scheduler
     const env = {
@@ -37,8 +47,8 @@ function runClaude(config, prompt) {
     let err = '';
     const timer = setTimeout(() => {
       child.kill();
-      reject(new Error(`Quá ${config.timeoutMinutes} phút, đã dừng`));
-    }, config.timeoutMinutes * 60_000);
+      reject(new Error(`Quá ${timeoutMinutes} phút, đã dừng`));
+    }, timeoutMinutes * 60_000);
 
     child.stdout.on('data', (d) => (out += d));
     child.stderr.on('data', (d) => (err += d));
@@ -49,56 +59,102 @@ function runClaude(config, prompt) {
     child.on('close', (code) => {
       clearTimeout(timer);
       if (code === 0 && out.trim()) resolve(out.trim());
-      else reject(new Error(`claude thoát với mã ${code}: ${err.trim().slice(0, 500)}`));
+      else reject(new Error(`claude thoát với mã ${code}: ${(err.trim() || out.trim()).slice(0, 500)}`));
     });
 
     child.stdin.end(prompt); // prompt dài đi qua stdin, tránh lỗi quoting trên từng hệ điều hành
   });
 }
 
-async function sendTelegram({ botToken, chatId }, text) {
-  if (!botToken || !chatId) return false;
-  const chunks = [];
-  for (let i = 0; i < text.length; i += 3900) chunks.push(text.slice(i, i + 3900));
-  for (const chunk of chunks) {
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: chunk, disable_web_page_preview: true }),
+// Lượt một: nhờ Claude rút từ khóa từ ngữ cảnh làm việc. Lỗi ở đây không chặn digest.
+async function extractTopics(config, context) {
+  const hn = config.sources.hackernews;
+  if (!hn.enabled || !hn.topicSearch) return [];
+  if (!context.interests && !context.gitlog && !context.sessions) return [];
+  try {
+    const out = await runClaude(config, buildTopicsPrompt(config, context), {
+      timeoutMinutes: Math.min(3, config.timeoutMinutes),
     });
-    if (!res.ok) throw new Error(`Telegram trả về ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const topics = parseTopics(out);
+    log(topics.length ? `Chủ đề tìm kiếm: ${topics.join(', ')}` : 'Không rút được chủ đề nào');
+    return topics;
+  } catch (e) {
+    log(`Bỏ qua tìm theo chủ đề: ${e.message}`);
+    return [];
   }
-  return true;
+}
+
+function describeStats(stats) {
+  return stats.map((s) => (s.error ? `${s.name}: LỖI ${s.error}` : `${s.name}: ${s.count} bài`)).join('; ');
+}
+
+function reportDelivery(results) {
+  for (const r of results) {
+    const line = r.ok ? `Đã gửi ${r.name} (${r.detail})` : `Lỗi gửi ${r.name}: ${r.detail}`;
+    log(line);
+    console.error(line);
+  }
+  return results.every((r) => r.ok);
+}
+
+function latestDigest() {
+  let files = [];
+  try {
+    files = fs.readdirSync(DIGEST_DIR).filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f)).sort();
+  } catch {}
+  if (!files.length) throw new Error(`Chưa có digest nào trong ${DIGEST_DIR}`);
+  const file = files[files.length - 1];
+  return { title: `Daily digest ${file.slice(0, 10)}`, markdown: fs.readFileSync(path.join(DIGEST_DIR, file), 'utf8') };
 }
 
 async function main() {
   const config = loadConfig();
-  const prompt = buildPrompt(config);
+
+  if (args.has('--resend')) {
+    if (!channels(config).some((c) => c.enabled)) throw new Error('Chưa bật kênh gửi nào trong config.json');
+    if (!reportDelivery(await deliver(config, latestDigest()))) process.exitCode = 1;
+    return;
+  }
+
+  if (args.has('--sources')) {
+    const { candidates, stats } = await collectCandidates(config, { seenUrls: loadSeen() });
+    for (const s of stats) console.log(s.error ? `${s.name}: LỖI ${s.error}` : `${s.name}: ${s.count} bài`);
+    console.log(`Tổng sau khi bỏ trùng và bỏ bài đã gửi: ${candidates.length} bài`);
+    if (!stats.length) console.log('Không bật nguồn nào ngoài daily.dev.');
+    if (stats.some((s) => s.error)) process.exitCode = 1;
+    return;
+  }
+
+  const context = workContext(config);
 
   if (args.has('--dry-run')) {
-    process.stdout.write(prompt + '\n');
+    const { candidates } = await collectCandidates(config, { seenUrls: loadSeen() });
+    process.stdout.write(buildPrompt(config, { candidates: formatCandidates(candidates), context }) + '\n');
     return;
   }
 
   ensureDirs();
   log('Bắt đầu tạo digest');
-  const result = await runClaude(config, prompt);
+  const topics = await extractTopics(config, context);
+  const { candidates, stats } = await collectCandidates(config, { topics, seenUrls: loadSeen() });
+  if (stats.length) log(`Nguồn tin: ${describeStats(stats)}. Còn ${candidates.length} bài ứng viên`);
+
+  const useDailyDev = config.sources.dailydev.enabled;
+  if (!candidates.length && !useDailyDev) throw new Error('Không nguồn nào trả về bài, không tạo được digest');
+
+  const prompt = buildPrompt(config, { candidates: formatCandidates(candidates), context });
+  const result = await runClaude(config, prompt, { allowedTools: useDailyDev ? config.allowedTools : [] });
 
   const today = new Date().toLocaleDateString('sv-SE');
   const file = path.join(DIGEST_DIR, `${today}.md`);
-  const content = `# Daily digest ${today}\n\n${result}\n`;
+  const title = `Daily digest ${today}`;
+  const content = `# ${title}\n\n${result}\n`;
   fs.writeFileSync(file, content);
   saveSeen(extractUrls(result));
   log(`Đã lưu ${file}`);
   console.log(content);
 
-  if (!args.has('--no-send')) {
-    try {
-      if (await sendTelegram(config.telegram, content)) log('Đã gửi Telegram');
-    } catch (e) {
-      log(`Lỗi gửi Telegram: ${e.message}`);
-    }
-  }
+  if (!args.has('--no-send')) reportDelivery(await deliver(config, { title, markdown: content }));
 }
 
 main().catch((e) => {

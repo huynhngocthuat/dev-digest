@@ -1,9 +1,9 @@
 {
   "name": "daily-digest",
   "displayName": "Daily Digest",
-  "version": "0.1.0",
-  "description": "Chọn bài daily.dev mỗi ngày dựa trên việc bạn đang làm, gửi qua file hoặc Telegram",
+  "version": "0.2.0",
+  "description": "Bản tin công nghệ mỗi ngày từ daily.dev, Hacker News, Reddit và TLDR, chọn theo việc bạn đang làm, gửi qua file, Telegram hoặc Notion",
   "author": { "name": "Your Name" },
   "license": "MIT",
-  "keywords": ["daily.dev", "digest", "reading-list"]
+  "keywords": ["daily.dev", "hacker-news", "reddit", "tldr", "digest", "reading-list", "telegram", "notion"]
 }

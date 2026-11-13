@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 // Cách dùng: node setup.mjs <init|install|uninstall|status|test>
+//   test             chạy thử một lần đầy đủ (có gọi Claude)
+//   test --sources   chỉ thử các nguồn tin
+//   test --resend    gửi lại digest mới nhất tới các kênh
+//   test --dry-run   in prompt sẽ gửi cho Claude
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   APP_DIR, BASE_DIR, CONFIG_PATH, DEFAULT_INTERESTS, DIGEST_DIR, HOME, INTERESTS_PATH, LOG_PATH,
-  PLUGIN_ROOT, ensureDirs, loadConfig, writeConfig,
+  PLUGIN_ROOT, ensureDirs, loadConfig, maskSecrets, writeConfig,
 } from './lib.mjs';
+import { channels } from './deliver/index.mjs';
 
 const TAG = 'daily-digest';
 const MAC_LABEL = 'dev.daily-digest';
@@ -150,6 +155,16 @@ const platform =
       ? { name: 'Task Scheduler', install: winInstall, uninstall: winUninstall, status: winStatus }
       : { name: 'cron', install: cronInstall, uninstall: cronUninstall, status: cronStatus };
 
+function describeSources(cfg) {
+  const s = cfg.sources;
+  const on = [];
+  if (s.dailydev.enabled) on.push('daily.dev');
+  if (s.hackernews.enabled) on.push('Hacker News');
+  if (s.reddit.enabled && s.reddit.subreddits.length) on.push(`Reddit (${s.reddit.subreddits.map((x) => `r/${x}`).join(', ')})`);
+  if (s.tldr.enabled && s.tldr.newsletters.length) on.push(`TLDR (${s.tldr.newsletters.join(', ')})`);
+  return on.join('; ') || '(không có)';
+}
+
 // ---------- Lệnh ----------
 const commands = {
   init() {
@@ -158,10 +173,9 @@ const commands = {
     if (!cfg.claudePath) cfg.claudePath = detectClaude();
     if (!fs.existsSync(CONFIG_PATH) || !loadConfig().claudePath) writeConfig(cfg);
     if (!fs.existsSync(INTERESTS_PATH)) fs.writeFileSync(INTERESTS_PATH, DEFAULT_INTERESTS);
-    const shown = { ...cfg, telegram: { chatId: cfg.telegram.chatId, botToken: cfg.telegram.botToken ? '(đã đặt)' : '' } };
     console.log(JSON.stringify({
       baseDir: BASE_DIR, configPath: CONFIG_PATH, interestsPath: INTERESTS_PATH,
-      digestDir: DIGEST_DIR, scheduler: platform.name, nodeVersion: process.version, config: shown,
+      digestDir: DIGEST_DIR, scheduler: platform.name, nodeVersion: process.version, config: maskSecrets(cfg),
     }, null, 2));
     if (!cfg.claudePath) console.warn('CẢNH BÁO: không tìm thấy lệnh claude. Hãy điền "claudePath" trong config.json.');
   },
@@ -195,7 +209,8 @@ const commands = {
     console.log(`Giờ chạy: ${cfg.time} ${cfg.weekdaysOnly ? '(thứ 2 - thứ 6)' : '(mỗi ngày)'}`);
     console.log(`Claude: ${cfg.claudePath || '(chưa tìm thấy)'}`);
     console.log(`Repo theo dõi: ${cfg.repos.length ? cfg.repos.join(', ') : '(không có)'}`);
-    console.log(`Telegram: ${cfg.telegram.botToken && cfg.telegram.chatId ? 'bật' : 'tắt'}`);
+    console.log(`Nguồn tin: ${describeSources(cfg)}`);
+    console.log(`Kênh gửi: ${channels(cfg).map((c) => `${c.name} ${c.enabled ? 'bật' : 'tắt'}`).join(', ')}`);
     try {
       const tail = fs.readFileSync(LOG_PATH, 'utf8').trim().split('\n').slice(-5).join('\n');
       console.log(`\nLog gần nhất:\n${tail}`);
@@ -211,7 +226,7 @@ const commands = {
 
 const cmd = process.argv[2];
 if (!commands[cmd]) {
-  console.error('Cách dùng: node setup.mjs <init|install|uninstall|status|test>');
+  console.error('Cách dùng: node setup.mjs <init|install|uninstall|status|test [--sources|--resend|--dry-run|--no-send]>');
   process.exit(1);
 }
 try {
