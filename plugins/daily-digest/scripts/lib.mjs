@@ -6,7 +6,8 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const HOME = os.homedir();
-export const BASE_DIR = path.join(HOME, '.daily-digest');
+// DAILY_DIGEST_HOME cho phép chạy thử với thư mục dữ liệu khác mà không đụng tới dữ liệu thật
+export const BASE_DIR = process.env.DAILY_DIGEST_HOME || path.join(HOME, '.daily-digest');
 export const APP_DIR = path.join(BASE_DIR, 'app');
 export const CONFIG_PATH = path.join(BASE_DIR, 'config.json');
 export const INTERESTS_PATH = path.join(BASE_DIR, 'interests.md');
@@ -19,19 +20,29 @@ export const MARKER = '[daily-digest]';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const PLUGIN_ROOT = path.resolve(HERE, '..');
 const PROMPT_TEMPLATE = path.join(PLUGIN_ROOT, 'prompts', 'digest.md');
+const TOPICS_TEMPLATE = path.join(PLUGIN_ROOT, 'prompts', 'topics.md');
 
 export const DEFAULT_CONFIG = {
   repos: [],
   time: '08:00',
   weekdaysOnly: true,
   daysBack: 2,
-  articleCount: 5,
+  articleCount: 5, // số bài phần "Liên quan việc đang làm"
+  trendingCount: 3, // số bài phần "Đáng chú ý hôm nay"
   language: 'tiếng Việt',
   includeClaudeSessions: true,
   claudePath: '',
   allowedTools: ['mcp__plugin_daily-digest_daily-dev', 'mcp__daily-dev'],
   timeoutMinutes: 10,
+  maxCandidates: 150,
+  sources: {
+    dailydev: { enabled: true },
+    hackernews: { enabled: true, limit: 30, minPoints: 50, topicSearch: true, topicSearchDays: 7 },
+    reddit: { enabled: true, subreddits: ['programming', 'webdev', 'devops', 'MachineLearning'], limit: 25 },
+    tldr: { enabled: true, newsletters: ['tech', 'dev', 'ai'] },
+  },
   telegram: { botToken: '', chatId: '' },
+  notion: { token: '', parentPage: '' },
 };
 
 export const DEFAULT_INTERESTS = `- (Chủ đề bạn luôn muốn theo dõi, ví dụ: Spring Boot, Vue 3, RAG)
@@ -42,6 +53,21 @@ export function ensureDirs() {
   fs.mkdirSync(DIGEST_DIR, { recursive: true });
 }
 
+// Gộp cấu hình người dùng lên mặc định. Config cũ (chưa có sources, notion) vẫn dùng được.
+export function mergeConfig(user = {}) {
+  const sources = {};
+  for (const [name, defaults] of Object.entries(DEFAULT_CONFIG.sources)) {
+    sources[name] = { ...defaults, ...(user.sources?.[name] || {}) };
+  }
+  return {
+    ...DEFAULT_CONFIG,
+    ...user,
+    sources,
+    telegram: { ...DEFAULT_CONFIG.telegram, ...(user.telegram || {}) },
+    notion: { ...DEFAULT_CONFIG.notion, ...(user.notion || {}) },
+  };
+}
+
 export function loadConfig() {
   let user = {};
   try {
@@ -49,10 +75,16 @@ export function loadConfig() {
   } catch {
     /* chưa có cấu hình thì dùng mặc định */
   }
+  return mergeConfig(user);
+}
+
+// Bản cấu hình an toàn để in ra màn hình: không lộ token
+export function maskSecrets(config) {
+  const mark = (v) => (v ? '(đã đặt)' : '');
   return {
-    ...DEFAULT_CONFIG,
-    ...user,
-    telegram: { ...DEFAULT_CONFIG.telegram, ...(user.telegram || {}) },
+    ...config,
+    telegram: { ...config.telegram, botToken: mark(config.telegram.botToken) },
+    notion: { ...config.notion, token: mark(config.notion.token) },
   };
 }
 
@@ -147,7 +179,8 @@ export function recentClaudeQuestions(daysBack, limit = 40) {
             ? c.filter((x) => x && x.type === 'text').map((x) => x.text).join(' ')
             : '';
       const clean = text.replace(/\s+/g, ' ').trim();
-      if (!clean || clean.startsWith('<') || clean.includes(MARKER)) continue;
+      // Bỏ thẻ hệ thống, ghi chú ảnh đính kèm và prompt của chính digest
+      if (!clean || clean.startsWith('<') || clean.startsWith('[Image') || clean.includes(MARKER)) continue;
       items.push({ ts, text: clean.slice(0, 200) });
     }
   }
@@ -174,20 +207,68 @@ export function extractUrls(markdown) {
   return [...new Set(markdown.match(/https?:\/\/[^\s)>\]]+/g) || [])];
 }
 
-export function buildPrompt(config = loadConfig()) {
-  const template = fs.readFileSync(PROMPT_TEMPLATE, 'utf8');
-  const seen = loadSeen().slice(-100);
-  const values = {
-    MARKER,
-    DATE: new Date().toLocaleDateString('sv-SE'), // YYYY-MM-DD theo giờ máy
-    COUNT: String(config.articleCount),
-    LANGUAGE: config.language,
-    INTERESTS: readInterests() || '(chưa khai báo)',
-    GITLOG: gitActivity(config.repos, config.daysBack) || '(không có)',
-    SESSIONS: config.includeClaudeSessions
-      ? recentClaudeQuestions(config.daysBack) || '(không có)'
-      : '(đã tắt)',
-    SEEN: seen.length ? seen.map((u) => `- ${u}`).join('\n') : '(chưa có)',
+const fill = (template, values) => template.replace(/\{\{(\w+)\}\}/g, (m, key) => values[key] ?? m);
+const today = () => new Date().toLocaleDateString('sv-SE'); // YYYY-MM-DD theo giờ máy
+
+// Sở thích, commit và câu hỏi gần đây: phần ngữ cảnh chung của cả hai prompt
+export function workContext(config) {
+  return {
+    interests: readInterests(),
+    gitlog: gitActivity(config.repos, config.daysBack),
+    sessions: config.includeClaudeSessions ? recentClaudeQuestions(config.daysBack) : '',
   };
-  return template.replace(/\{\{(\w+)\}\}/g, (m, key) => values[key] ?? m);
+}
+
+function contextValues(config, ctx) {
+  return {
+    MARKER,
+    DATE: today(),
+    INTERESTS: ctx.interests || '(chưa khai báo)',
+    GITLOG: ctx.gitlog || '(không có)',
+    SESSIONS: config.includeClaudeSessions ? ctx.sessions || '(không có)' : '(đã tắt)',
+  };
+}
+
+const DAILYDEV_STEP =
+  'Dùng các tool của daily.dev: xem feed cá nhân hóa (For You) và tìm bài theo từng chủ đề. ' +
+  'Bài tìm được ở đây cũng là ứng viên, ngang hàng với danh sách ở trên. ' +
+  'Chỉ đọc: không bookmark, không follow, không thay đổi gì trên tài khoản daily.dev. ' +
+  'Nếu không có tool daily.dev hoặc tool báo lỗi, vẫn soạn bản tin từ danh sách ứng viên và thêm đúng một dòng ở cuối: ' +
+  '"**Ghi chú:** không đọc được daily.dev."';
+const NO_DAILYDEV_STEP = 'Không dùng tool nào. Chỉ chọn bài từ danh sách ứng viên ở trên.';
+
+// `candidates` là chuỗi đã định dạng từ sources/index.mjs (formatCandidates)
+export function buildPrompt(config = loadConfig(), { candidates = '', context = workContext(config) } = {}) {
+  const seen = loadSeen().slice(-100);
+  return fill(fs.readFileSync(PROMPT_TEMPLATE, 'utf8'), {
+    ...contextValues(config, context),
+    COUNT: String(config.articleCount),
+    TRENDING_COUNT: String(config.trendingCount),
+    LANGUAGE: config.language,
+    CANDIDATES: candidates || '(không lấy được bài nào)',
+    DAILYDEV_STEP: config.sources.dailydev.enabled ? DAILYDEV_STEP : NO_DAILYDEV_STEP,
+    SEEN: seen.length ? seen.map((u) => `- ${u}`).join('\n') : '(chưa có)',
+  });
+}
+
+// Prompt lượt một: rút từ khóa để tìm bài theo chủ đề
+export function buildTopicsPrompt(config = loadConfig(), context = workContext(config)) {
+  return fill(fs.readFileSync(TOPICS_TEMPLATE, 'utf8'), contextValues(config, context));
+}
+
+// Lấy mảng JSON đầu tiên trong câu trả lời; trả về [] nếu không đọc được
+export function parseTopics(text) {
+  const m = /\[[\s\S]*?\]/.exec(String(text));
+  if (!m) return [];
+  try {
+    const arr = JSON.parse(m[0]);
+    if (!Array.isArray(arr)) return [];
+    const topics = arr
+      .filter((t) => typeof t === 'string')
+      .map((t) => t.replace(/\s+/g, ' ').trim().slice(0, 60))
+      .filter(Boolean);
+    return [...new Set(topics)].slice(0, 5);
+  } catch {
+    return [];
+  }
 }
